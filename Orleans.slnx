@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Orleans.Client/Orleans.Client.csproj" />
+  <Project Path="Orleans.Grains/Orleans.Grains.csproj" />
+  <Project Path="Orleans.Silo/Orleans.Silo.csproj" />
+</Solution>
