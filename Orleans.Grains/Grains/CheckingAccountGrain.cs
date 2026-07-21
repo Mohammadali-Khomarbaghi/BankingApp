@@ -1,19 +1,28 @@
-﻿using Orleans.Grains.Abstractions;
+﻿using Orleans.Concurrency;
+using Orleans.Grains.Abstractions;
 using Orleans.Grains.States;
+using Orleans.Transactions.Abstractions;
 
 namespace Orleans.Grains.Grains;
 
+[Reentrant]
 public class CheckingAccountGrain : Grain, ICheckingAccountGrain, IRemindable
 {
 
-    private readonly IPersistentState<BalanceState> _balanceState;
+    private readonly ITransactionClient _transactionClient;
+    private readonly ITransactionalState<BalanceState> _balanceTransactionalState;
+    private readonly IPersistentState<PaymentState> _paymentState;
     private readonly IPersistentState<CheckingAccountState> _checkingAccountState;
 
     public CheckingAccountGrain(
-        [PersistentState("balance", "OrleansTableStorage")] IPersistentState<BalanceState> balanceState,
+        ITransactionClient transactionClient,
+        [TransactionalState("balance")] ITransactionalState<BalanceState> balanceTransactionalState,
+        [PersistentState("payment", "OrleansBlobStorage")] IPersistentState<PaymentState> paymentState,
         [PersistentState("checkingAccount", "OrleansBlobStorage")] IPersistentState<CheckingAccountState> checkingAccountState)
     {
-        _balanceState = balanceState;
+        _transactionClient = transactionClient;
+        _balanceTransactionalState = balanceTransactionalState;
+        _paymentState = paymentState;
         _checkingAccountState = checkingAccountState;
     }
 
@@ -26,68 +35,84 @@ public class CheckingAccountGrain : Grain, ICheckingAccountGrain, IRemindable
             OccursEveryMinutes = reccursEveryMinutes
         });
         await _checkingAccountState.WriteStateAsync();
-        
-        await this. RegisterOrUpdateReminder($"RecrringPayment:::{id}",
+
+        _paymentState.State.RetryCount = 0;
+        await _paymentState.WriteStateAsync();
+
+        await this.RegisterOrUpdateReminder($"RecrringPayment:::{id}",
             TimeSpan.FromMinutes(reccursEveryMinutes),
             TimeSpan.FromMinutes(reccursEveryMinutes));
     }
 
     public async Task ReceiveReminder(string reminderName, TickStatus status)
     {
-        if(reminderName.StartsWith("RecrringPayment:::"))
+        if (reminderName.StartsWith($"RecrringPayment"))
         {
+            _paymentState.State.RetryCount++;
             var paymentId = Guid.Parse(reminderName.Split(":::").Last());
-            var recurringPayment = _checkingAccountState.State.RecurringPayments.Single(p => p.PaymentId == paymentId);
-            if (recurringPayment != null)
+
+            if (_paymentState.State.RetryCount >= _paymentState.State.MaxRetries)
             {
-                Console.WriteLine($"Recurring Payment Triggered: {recurringPayment.PaymentAmount} for PaymentId: {paymentId}");
-                await DebitAsync(recurringPayment.PaymentAmount);
+                IGrainReminder reminder = await this.GetReminder($"RecrringPayment:::{paymentId}");
+                if (reminder != null)
+                {
+                    await this.UnregisterReminder(reminder);
+                }
+
+                var FinishedrecurringPaymentIndex = _checkingAccountState.State.RecurringPayments.FindIndex(state => state.PaymentId == paymentId);
+                _checkingAccountState.State.RecurringPayments.RemoveAt(FinishedrecurringPaymentIndex);
+                await _checkingAccountState.WriteStateAsync();
+            }
+            else
+            {
+
+                var recurringPayment = _checkingAccountState.State.RecurringPayments.Single(p => p.PaymentId == paymentId);
+                if (recurringPayment != null)
+                {
+                    Console.WriteLine($"Recurring Payment Triggered: {recurringPayment.PaymentAmount} for PaymentId: {paymentId}");
+                    await _transactionClient.RunTransaction(TransactionOption.Create, async () =>
+                    {
+                        await DebitAsync(recurringPayment.PaymentAmount);
+                    });
+                }
             }
         }
     }
 
     public async Task CreditAsync(decimal amount)
     {
-        //Timer
-        //RegisterTimer(async (object obj) =>
-        //{
-        //    Console.WriteLine("Timer triggered");
-        //    await Task.Delay(TimeSpan.FromSeconds(10));
-        //    Console.WriteLine("Timer Finished");
-        //}, null, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(10));
-
-        var currentBalance = _balanceState.State.Balance;
-        var newBalance = currentBalance + amount;
-        _balanceState.State.Balance = newBalance;
-        await _balanceState.WriteStateAsync();
+        await _balanceTransactionalState.PerformUpdate(state =>
+        {
+            var currentBalance = state.Balance;
+            var newBalance = currentBalance + amount;
+            state.Balance = newBalance;
+        });
     }
 
     public async Task DebitAsync(decimal amount)
     {
-        //Console.WriteLine("-- Debit Started --");
-        //await Task.Delay(TimeSpan.FromSeconds(20));
-        //Console.WriteLine("-- Debit Ended --");
-
-        var currentBalance = _balanceState.State.Balance;
-        var newBalance = currentBalance - amount;
-        _balanceState.State.Balance = newBalance;
-        await _balanceState.WriteStateAsync();
+        await _balanceTransactionalState.PerformUpdate(state =>
+        {
+            var currentBalance = state.Balance;
+            var newBalance = currentBalance - amount;
+            state.Balance = newBalance;
+        });
     }
 
     public async Task<decimal> GetBalanceAsync()
     {
-        return _balanceState.State.Balance;
+        return await _balanceTransactionalState.PerformRead(state => state.Balance);
     }
 
     public async Task InitialiseAsync(decimal openingBalance)
     {
+        await _balanceTransactionalState.PerformUpdate(state =>
+        {
+            state.Balance = openingBalance;
+        });
         _checkingAccountState.State.OpenedAtUtc = DateTime.UtcNow;
         _checkingAccountState.State.AccountId = this.GetPrimaryKey();
         _checkingAccountState.State.AccountType = "Default";
-        _balanceState.State.Balance = openingBalance;
-        await _balanceState.WriteStateAsync();
         await _checkingAccountState.WriteStateAsync();
     }
-
-
 }
